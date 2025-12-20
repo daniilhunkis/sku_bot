@@ -1,0 +1,889 @@
+from __future__ import annotations
+
+import json
+
+from aiogram import Router, F, Bot
+from aiogram.types import BufferedInputFile
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, BufferedInputFile
+from aiogram.fsm.context import FSMContext
+from aiogram.filters import CommandStart
+
+from app.repo import Repo
+from app.keyboards import (
+    main_menu_kb,
+    marketplaces_kb,
+    schemes_kb,
+    commission_mode_kb,
+    ads_mode_kb,
+    tax_mode_kb,
+    input_help_kb,
+    result_kb,
+    packs_kb,
+    result_saved_kb,
+)
+from app.states import CalcFlow
+from app.services.calc import CalcInputs, compute
+from app.services.pdf_report import build_pdf
+from app.utils import fmt_money, fmt_pct
+
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+router = Router()
+
+
+def _set_input(data_inputs: dict, key: str, value, source: str) -> None:
+    data_inputs[key] = {"value": value, "source": source}
+
+
+def _get_input(data_inputs: dict, key: str):
+    return data_inputs.get(key, {}).get("value")
+
+
+async def _ensure_state_basics(state: FSMContext) -> None:
+    data = await state.get_data()
+    if "inputs" not in data:
+        await state.update_data(inputs={})
+
+
+FRIENDLY_FIELD_NAMES = {
+    "price": "Цена продажи",
+    "cogs": "Себестоимость",
+    "commission_mode": "Режим комиссии",
+    "commission_value": "Комиссия маркетплейса",
+    "logistics": "Логистика",
+    "storage": "Хранение",
+    "returns_pct": "Доля возвратов",
+    "return_cost": "Стоимость обработки возврата",
+    "ads_mode": "Режим рекламы",
+    "ads_value": "Расходы на рекламу",
+    "other_fees": "Прочие сборы",
+    "opex_var": "Прочие переменные расходы",
+    "tax_mode": "Режим налогообложения",
+    "tax_rate": "Ставка налога",
+}
+
+
+def _notes(data_inputs: dict) -> tuple[str, list[str]]:
+    defaults = [
+        k
+        for k, v in data_inputs.items()
+        if v.get("source") == "DEFAULT" and float(v.get("value") or 0) != 0
+    ]
+    zeros = [
+        k
+        for k, v in data_inputs.items()
+        if v.get("source") == "ZERO" and float(v.get("value") or 0) == 0
+    ]
+
+    if len(defaults) <= 1 and len(zeros) <= 1:
+        lvl = "🟢 Высокая (ключевые цифры введены вами)"
+    elif len(defaults) <= 4 and len(zeros) <= 3:
+        lvl = "🟡 Средняя (есть справочные/нулевые поля)"
+    else:
+        lvl = "🔴 Низкая (много предположений; лучше уточнить цифры)"
+
+    notes: list[str] = []
+    for k in defaults:
+        label = FRIENDLY_FIELD_NAMES.get(k, k)
+        notes.append(f"{label}: справочное значение")
+    for k in zeros:
+        label = FRIENDLY_FIELD_NAMES.get(k, k)
+        notes.append(f"{label}: не учитывалось (0)")
+    return lvl, notes
+
+
+def _build_calcinputs(data_inputs: dict) -> CalcInputs:
+    return CalcInputs(
+        price=float(_get_input(data_inputs, "price")),
+        cogs=float(_get_input(data_inputs, "cogs")),
+        commission_mode=_get_input(data_inputs, "commission_mode"),
+        commission_value=float(_get_input(data_inputs, "commission_value")),
+        logistics=float(_get_input(data_inputs, "logistics")),
+        storage=float(_get_input(data_inputs, "storage")),
+        returns_pct=float(_get_input(data_inputs, "returns_pct")),
+        return_cost=float(_get_input(data_inputs, "return_cost")),
+        ads_mode=_get_input(data_inputs, "ads_mode"),
+        ads_value=float(_get_input(data_inputs, "ads_value")),
+        other_fees=float(_get_input(data_inputs, "other_fees")),
+        opex_var=float(_get_input(data_inputs, "opex_var")),
+        tax_mode=_get_input(data_inputs, "tax_mode"),
+        tax_rate=float(_get_input(data_inputs, "tax_rate")),
+    )
+
+
+def _safe_float(text: str) -> float:
+    t = text.strip().replace(" ", "").replace(",", ".")
+    return float(t)
+
+
+def _pct_to_frac(text: str) -> float:
+    return _safe_float(text) / 100.0
+
+
+def _field_prompt(field: str, state_data: dict) -> tuple[str, str]:
+    if field == "price":
+        return (
+            "Введите цену продажи (₽).",
+            "Нужно для расчёта выручки и всех процентов (комиссия/ДРР).",
+        )
+    if field == "cogs":
+        return (
+            "Введите себестоимость (₽).",
+            "Закупка + упаковка. Без неё прибыль будет завышена.",
+        )
+    if field == "commission_mode":
+        return (
+            "Как указать комиссию маркетплейса?",
+            "Комиссия — прямой вычет из выручки.",
+        )
+    if field == "commission_value":
+        cm = (state_data.get("inputs", {}).get("commission_mode", {}) or {}).get(
+            "value"
+        )
+        if cm == "PCT":
+            return (
+                "Введите комиссию (%). Например: 18",
+                "Комиссия рассчитывается как % от цены.",
+            )
+        return (
+            "Введите комиссию (₽).",
+            "Комиссия вычитается из каждой продажи.",
+        )
+    if field == "logistics":
+        return (
+            "Введите логистику на 1 продажу (₽).",
+            "Часто логистика «съедает» маржу.",
+        )
+    if field == "storage":
+        return (
+            "Введите хранение (₽ на 1 продажу).",
+            "Если товар лежит долго — хранение снижает прибыль.",
+        )
+    if field == "returns_pct":
+        return (
+            "Введите % заказов, которые возвращают. Например: 5",
+            "Нужен, чтобы посчитать ожидаемые расходы на возвраты на каждую продажу.",
+        )
+    if field == "return_cost":
+        return (
+            "Введите стоимость обработки ОДНОГО возврата (₽).",
+            "Мы умножим её на долю возвратов и получим средний расход на возвраты на одну продажу.",
+        )
+    if field == "ads_mode":
+        return (
+            "Как учитывать рекламу?",
+            "Выберите удобный режим: ₽/продажа или ДРР%.",
+        )
+    if field == "ads_value":
+        am = (state_data.get("inputs", {}).get("ads_mode", {}) or {}).get("value")
+        if am == "DRR":
+            return (
+                "Введите ДРР (%). Например: 12",
+                "Реклама будет считаться как % от цены.",
+            )
+        return (
+            "Введите рекламу на 1 продажу (₽).",
+            "Реклама напрямую снижает прибыль.",
+        )
+    if field == "other_fees":
+        return (
+            "Введите прочие сборы (₽ на 1 продажу).",
+            "Приёмка, обработка, эквайринг и др. Если не знаете — можно 0, но точность снизится.",
+        )
+    if field == "opex_var":
+        return (
+            "Введите прочие переменные расходы (₽ на 1 продажу).",
+            "Любые дополнительные переменные расходы (брак, доп. упаковка и т.п.).",
+        )
+    if field == "tax_mode":
+        return (
+            "Как считается налог?",
+            "Выберите, с чего считать налог: с выручки или с прибыли (доходы минус расходы).",
+        )
+    if field == "tax_rate":
+        return (
+            "Введите ставку налога (%).",
+            "Используем для расчёта чистой прибыли после налогов.",
+        )
+    return ("Введите значение.", "Нужно для расчёта.")
+
+
+def _field_kb(field: str):
+    from app.keyboards import input_help_kb  # локальный импорт, чтобы избежать циклов
+
+    if field == "commission_mode":
+        return commission_mode_kb()
+    if field == "ads_mode":
+        return ads_mode_kb()
+    if field == "tax_mode":
+        return tax_mode_kb()
+    allow_default = field in {"storage", "return_cost", "other_fees", "opex_var", "logistics"}
+    allow_zero = field not in {"price"}
+    return input_help_kb(field, allow_default=allow_default, allow_zero=allow_zero)
+
+
+async def _ask_field(message: Message | CallbackQuery, state: FSMContext, field: str):
+    await state.update_data(current_field=field)
+    q, why = _field_prompt(field, state_data=await state.get_data())
+    kb = _field_kb(field)
+    text = f"{q}\n\n{why}"
+    if isinstance(message, CallbackQuery):
+        await message.message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+
+
+async def _apply_default(repo: Repo, state: FSMContext, field: str) -> float:
+    data = await state.get_data()
+    mp = data.get("marketplace")
+    scheme = data.get("scheme")
+    key_map = {
+        "logistics": "logistics_rub_per_sale",
+        "storage": "storage_rub_per_sale",
+        "return_cost": "return_cost_rub",
+        "other_fees": "other_fees_rub_per_sale",
+        "opex_var": "opex_var_rub_per_sale",
+    }
+    key = key_map.get(field)
+    if not key:
+        return 0.0
+    row = await repo.db.fetchrow(
+        "SELECT value FROM reference_values WHERE marketplace=$1 AND (scheme=$2 OR scheme IS NULL) AND key=$3",
+        mp,
+        scheme,
+        key,
+    )
+    return float(row["value"]) if row else 0.0
+
+
+_FIELD_ORDER = [
+    "price",
+    "cogs",
+    "commission_mode",
+    "commission_value",
+    "logistics",
+    "storage",
+    "returns_pct",
+    "return_cost",
+    "ads_mode",
+    "ads_value",
+    "other_fees",
+    "opex_var",
+    "tax_mode",
+    "tax_rate",
+]
+
+
+def _next_field(data_inputs: dict) -> str | None:
+    for f in _FIELD_ORDER:
+        if f not in data_inputs:
+            return f
+    return None
+
+
+def _prev_field(current: str) -> str | None:
+    if current not in _FIELD_ORDER:
+        return None
+    idx = _FIELD_ORDER.index(current)
+    if idx <= 0:
+        return None
+    return _FIELD_ORDER[idx - 1]
+
+
+def _build_result_text(mp: str, scheme: str, inputs: dict, results: dict, accuracy: str, notes: list[str], options: list[str], sku_label: str | None = None) -> str:
+    title_line = f"📦 {sku_label}" if sku_label else "📦 SKU"
+    header = f"{title_line}\n{mp} / {scheme}"
+
+    sign = "🔴" if results["net_profit"] < 0 else "🟢"
+
+    getv = lambda k: inputs.get(k, {}).get("value")
+
+    text_parts = [
+        header,
+        "",
+        f"{sign} Итог по 1 продаже",
+        "",
+        "💰 Финансы:",
+        f"• Выручка: {fmt_money(float(getv('price') or 0))}",
+        f"• Чистая прибыль: {fmt_money(results.get('net_profit'))}",
+        f"• Маржа: {fmt_pct(results.get('margin_pct'))}",
+        f"• Прибыль до налогов: {fmt_money(results.get('profit_before_tax'))}",
+        "",
+        "🏗 Расходы на 1 продажу:",
+        f"• Себестоимость: {fmt_money(float(getv('cogs') or 0))}",
+        f"• Комиссия маркетплейса: {fmt_money(results.get('commission_rub'))}",
+        f"• Логистика: {fmt_money(float(getv('logistics') or 0))}",
+        f"• Хранение: {fmt_money(float(getv('storage') or 0))}",
+        f"• Реклама: {fmt_money(results.get('ads_rub'))} (ДРР {fmt_pct(results.get('drr_pct'))})",
+        f"• Ожид. затраты на возвраты: {fmt_money(results.get('returns_cost_expected'))}",
+        f"• Прочие сборы: {fmt_money(float(getv('other_fees') or 0))}",
+        f"• Переменные опер. расходы: {fmt_money(float(getv('opex_var') or 0))}",
+        f"• Налог: {fmt_money(results.get('tax'))}",
+        "",
+        "📍 Ключевые точки:",
+        f"• Точка безубыточности (цена): {fmt_money(results.get('breakeven_price'))}",
+        f"• Макс. реклама без убытка: {fmt_money(results.get('max_ads_rub'))} (до {fmt_pct(results.get('max_drr_pct'))} ДРР)",
+        "",
+        f"Точность: {accuracy}",
+    ]
+
+    if notes:
+        text_parts.append("")
+        for n in notes[:6]:
+            text_parts.append(f"- {n}")
+
+    if options:
+        text_parts.append("")
+        text_parts.append("Варианты действий (по цифрам):")
+        for o in options[:4]:
+            text_parts.append(f"• {o}")
+
+    return "\n".join(text_parts)
+
+
+def _build_options(ci: CalcInputs, results: dict) -> list[str]:
+    P = ci.price
+    opts: list[str] = []
+
+    # +5% и +10% к цене
+    for pct in (0.05, 0.10):
+        new_price = P * (1 + pct)
+        ci2 = CalcInputs(**{**ci.__dict__, "price": new_price})
+        r2 = compute(ci2)
+        opts.append(
+            f"Если поднять цену на {int(pct * 100)}% до {fmt_money(new_price)}, "
+            f"чистая прибыль будет {fmt_money(r2['net_profit'])}, маржа {fmt_pct(r2['margin_pct'])}."
+        )
+
+    # безопасная реклама
+    opts.append(
+        "При текущей цене реклама на 1 продажу не должна превышать "
+        f"{fmt_money(results['max_ads_rub'])} (≈ {fmt_pct(results['max_drr_pct'])} ДРР), "
+        "чтобы SKU не уходил в минус."
+    )
+
+    # если SKU убыточен даже без рекламы
+    if results["net_profit"] < 0:
+        ci3 = CalcInputs(**{**ci.__dict__, "ads_mode": "PER_SALE", "ads_value": 0.0})
+        r3 = compute(ci3)
+        if r3["net_profit"] <= 0:
+            opts.append(
+                "Даже если совсем отключить рекламу, SKU остаётся убыточным — "
+                "надо пересмотреть себестоимость, логистику, комиссию или стратегию (например, распродажа)."
+            )
+
+    return opts
+
+
+async def _finish_and_show_result(message_or_cb, repo: Repo, state: FSMContext, from_history: bool = False):
+    data = await state.get_data()
+    inputs = data.get("inputs", {})
+    mp = data.get("marketplace")
+    scheme = data.get("scheme")
+    sku_label = data.get("sku_label")
+
+    ci = _build_calcinputs(inputs)
+    results = compute(ci)
+    acc, notes = _notes(inputs)
+    options = _build_options(ci, results)
+
+    # списываем кредит только для "живого" расчёта
+    if not from_history:
+        try:
+            used = await repo.consume_credit(
+                (message_or_cb.from_user.id if isinstance(message_or_cb, Message) else message_or_cb.from_user.id)
+            )
+        except RuntimeError as e:
+            if str(e) == "NO_CREDITS":
+                if isinstance(message_or_cb, Message):
+                    await message_or_cb.answer(
+                        "Бесплатные расчёты закончились. Нужно купить пакет SKU.",
+                        reply_markup=packs_kb(),
+                    )
+                else:
+                    await message_or_cb.message.answer(
+                        "Бесплатные расчёты закончились. Нужно купить пакет SKU.",
+                        reply_markup=packs_kb(),
+                    )
+                return
+            raise
+        await state.update_data(used_credit_type=used)
+
+    text = _build_result_text(mp, scheme, inputs, results, acc, notes, options, sku_label=sku_label)
+
+    await state.update_data(
+        results=results,
+        accuracy=acc,
+        accuracy_notes=notes,
+        options=options,
+    )
+
+    if isinstance(message_or_cb, Message):
+        await message_or_cb.answer(text, reply_markup=result_kb())
+    else:
+        await message_or_cb.message.edit_text(text, reply_markup=result_kb())
+
+    await state.set_state(CalcFlow.confirm)
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, repo: Repo):
+    await repo.upsert_user_on_start(message.from_user.id)
+    u = await repo.get_user(message.from_user.id)
+    left = u["free_credits"] if u else 0
+    await message.answer(
+        "Привет! Я помогу точно посчитать прибыль/убыток по SKU с учётом комиссий, логистики, рекламы и налогов.\n\n"
+        f"Осталось бесплатных расчётов: {left}",
+        reply_markup=main_menu_kb(),
+    )
+
+
+@router.callback_query(F.data == "menu")
+async def menu(cb: CallbackQuery, repo: Repo, state: FSMContext):
+    await state.clear()
+    u = await repo.get_user(cb.from_user.id)
+    left = u["free_credits"] if u else 0
+    await cb.message.edit_text(
+        f"Меню. Осталось бесплатных расчётов: {left}", reply_markup=main_menu_kb()
+    )
+
+
+@router.callback_query(F.data == "help:how")
+async def how(cb: CallbackQuery):
+    await cb.message.edit_text(
+        "Как считается:\n"
+        "• Мы считаем прибыль на 1 продажу по введённым цифрам.\n"
+        "• Возвраты учитываются как ожидаемые расходы на обработку/логистику на каждую продажу.\n"
+        "• Налоги считаются управленчески — чтобы вы могли принимать решения по цене и рекламе.\n"
+        "• Чем меньше справочных/нулевых полей, тем выше точность.",
+        reply_markup=main_menu_kb(),
+    )
+
+
+@router.callback_query(F.data == "calc:start")
+async def calc_start(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(CalcFlow.entering_label)
+    await cb.message.edit_text(
+        "Как назовём этот расчёт?\n\n"
+        "Напишите название товара или артикул SKU одним сообщением.",
+        reply_markup=None,
+    )
+
+@router.message(CalcFlow.entering_label)
+async def enter_label(message: Message, state: FSMContext):
+    label = (message.text or "").strip()
+    if not label:
+        await message.answer("Название пустое. Напишите хотя бы что-то (например, бренд + модель).")
+        return
+
+    await state.update_data(sku_label=label)
+    await state.set_state(CalcFlow.entering_value)
+    await _ask_field(message, state, "price")
+
+@router.callback_query(F.data.startswith("calc:mp:"))
+async def choose_mp(cb: CallbackQuery, state: FSMContext):
+    mp = cb.data.split(":")[-1]
+    # inputs сбрасываем, а sku_label оставляем как есть
+    await state.update_data(marketplace=mp, inputs={})
+    await state.set_state(CalcFlow.choosing_scheme)
+    from app.constants import SCHEMES_BY_MP
+
+    if mp not in SCHEMES_BY_MP:
+        await cb.message.edit_text(
+            "Для этого маркетплейса схемы пока не настроены.", reply_markup=main_menu_kb()
+        )
+        return
+    await cb.message.edit_text("Выберите схему работы:", reply_markup=schemes_kb(mp))
+
+
+@router.callback_query(F.data.startswith("calc:scheme:"))
+async def choose_scheme(cb: CallbackQuery, state: FSMContext):
+    scheme = cb.data.split(":")[-1]
+    await state.update_data(scheme=scheme, sku_label=None, inputs={})
+    await state.set_state(CalcFlow.entering_label)
+    await cb.message.edit_text(
+        "Как назовём этот расчёт?\n\n"
+        "Напишите название товара или артикул (можно коротко).",
+        reply_markup=None,
+    )
+
+
+@router.message(CalcFlow.entering_label)
+async def enter_label(message: Message, state: FSMContext):
+    label = (message.text or "").strip()
+    if not label:
+        await message.answer("Название пустое. Напишите, как будем обозначать этот SKU.")
+        return
+
+    await state.update_data(sku_label=label, inputs={})
+    await state.set_state(CalcFlow.entering_value)
+    await _ask_field(message, state, "price")
+
+
+@router.callback_query(F.data == "calc:back:mp")
+async def back_to_mp(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(CalcFlow.choosing_mp)
+    await cb.message.edit_text("Выберите маркетплейс:", reply_markup=marketplaces_kb())
+
+
+@router.callback_query(F.data == "calc:back:field")
+async def back_field(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    current = data.get("current_field")
+    if not current:
+        await cb.answer("Назад недоступно", show_alert=True)
+        return
+
+    if current == "price":
+        await state.set_state(CalcFlow.entering_label)
+        await cb.message.edit_text(
+            "Изменим название расчёта.\n\n"
+            "Введите новое название товара или артикул.\n\n"
+            "Отправьте текст сообщением."
+        )
+        return
+
+    prev_field = _prev_field(current)
+    if not prev_field:
+        await cb.answer("Назад недоступно", show_alert=True)
+        return
+
+    await _ask_field(cb, state, prev_field)
+
+
+@router.callback_query(F.data.startswith("calc:enter:"))
+async def enter_value_prompt(cb: CallbackQuery, state: FSMContext):
+    field = cb.data.split(":")[-1]
+    await state.update_data(current_field=field, awaiting_text=True)
+    q, why = _field_prompt(field, await state.get_data())
+    await state.set_state(CalcFlow.entering_value)
+    await cb.message.edit_text(
+        f"{q}\n\n{why}\n\nОтправьте число сообщением.", reply_markup=None
+    )
+
+
+@router.message(CalcFlow.entering_value)
+async def enter_value_message(message: Message, state: FSMContext, repo: Repo):
+    data = await state.get_data()
+    field = data.get("current_field")
+    if not field:
+        return
+
+    inputs = data.get("inputs", {})
+
+    try:
+        if field in {"returns_pct", "commission_value", "ads_value", "tax_rate"}:
+            if field == "returns_pct":
+                v = _pct_to_frac(message.text)
+            elif field == "tax_rate":
+                v = _pct_to_frac(message.text)
+            elif field == "commission_value":
+                cm = inputs.get("commission_mode", {}).get("value")
+                v = _pct_to_frac(message.text) if cm == "PCT" else _safe_float(message.text)
+            elif field == "ads_value":
+                am = inputs.get("ads_mode", {}).get("value")
+                v = _pct_to_frac(message.text) if am == "DRR" else _safe_float(message.text)
+            else:
+                v = _safe_float(message.text)
+        else:
+            v = _safe_float(message.text)
+
+        _set_input(inputs, field, v, "USER")
+        await state.update_data(inputs=inputs)
+    except Exception:
+        await message.answer("Не смог распознать число. Пример: 1234 или 12,5")
+        return
+
+    nextf = _next_field(inputs)
+    if nextf is None:
+        await _finish_and_show_result(message, repo, state, from_history=False)
+        return
+
+    if nextf in {"commission_mode", "ads_mode", "tax_mode"}:
+        await _ask_field(message, state, nextf)
+        return
+
+    await _ask_field(message, state, nextf)
+
+
+@router.callback_query(F.data.startswith("calc:commode:"))
+async def commode(cb: CallbackQuery, state: FSMContext):
+    mode = cb.data.split(":")[-1]
+    data = await state.get_data()
+    inputs = data.get("inputs", {})
+    _set_input(inputs, "commission_mode", mode, "USER")
+    await state.update_data(inputs=inputs)
+    await _ask_field(cb, state, "commission_value")
+
+
+@router.callback_query(F.data.startswith("calc:adsmode:"))
+async def adsmode(cb: CallbackQuery, state: FSMContext):
+    mode = cb.data.split(":")[-1]
+    data = await state.get_data()
+    inputs = data.get("inputs", {})
+    _set_input(inputs, "ads_mode", mode, "USER")
+    await state.update_data(inputs=inputs)
+    await _ask_field(cb, state, "ads_value")
+
+
+@router.callback_query(F.data.startswith("calc:tax:"))
+async def taxmode(cb: CallbackQuery, state: FSMContext):
+    mode = cb.data.split(":")[-1]
+    data = await state.get_data()
+    inputs = data.get("inputs", {})
+    _set_input(inputs, "tax_mode", mode, "USER")
+    await state.update_data(inputs=inputs)
+    await _ask_field(cb, state, "tax_rate")
+
+
+@router.callback_query(F.data.startswith("calc:default:"))
+async def field_default(cb: CallbackQuery, state: FSMContext, repo: Repo):
+    field = cb.data.split(":")[-1]
+    data = await state.get_data()
+    inputs = data.get("inputs", {})
+    v = await _apply_default(repo, state, field)
+    source = "DEFAULT" if v != 0 else "ZERO"
+    _set_input(inputs, field, v, source)
+    await state.update_data(inputs=inputs)
+    nextf = _next_field(inputs)
+    if nextf:
+        await _ask_field(cb, state, nextf)
+    else:
+        await cb.message.answer("Готово. Отправьте любое число, чтобы продолжить.")
+
+
+@router.callback_query(F.data.startswith("calc:zero:"))
+async def field_zero(cb: CallbackQuery, state: FSMContext):
+    field = cb.data.split(":")[-1]
+    data = await state.get_data()
+    inputs = data.get("inputs", {})
+    _set_input(inputs, field, 0.0, "ZERO")
+    await state.update_data(inputs=inputs)
+    nextf = _next_field(inputs)
+    if nextf:
+        await _ask_field(cb, state, nextf)
+
+
+@router.callback_query(F.data == "calc:save")
+async def save_calc(cb: CallbackQuery, state: FSMContext, repo: Repo):
+    data = await state.get_data()
+    if "results" not in data:
+        await cb.answer("Нет расчёта для сохранения", show_alert=True)
+        return
+    inputs = data.get("inputs", {})
+    results = data["results"]
+    mp = data.get("marketplace")
+    scheme = data.get("scheme")
+    used = data.get("used_credit_type", "FREE")
+    acc = data.get("accuracy", "")
+    sku_label = data.get("sku_label")
+
+    calc_id = await repo.save_calculation(
+        tg_user_id=cb.from_user.id,
+        marketplace=mp,
+        scheme=scheme,
+        sku_label=sku_label,
+        inputs=inputs,
+        results=results,
+        accuracy_level=acc,
+        used_credit_type=used,
+    )
+    await state.update_data(current_calc_id=calc_id)
+    await cb.answer("Сохранено ✅", show_alert=False)
+
+
+@router.callback_query(F.data == "calc:pdf")
+async def pdf_calc(cb: CallbackQuery, state: FSMContext, repo: Repo, bot: Bot):
+    data = await state.get_data()
+    if "results" not in data:
+        await cb.answer("Сначала сделайте расчёт", show_alert=True)
+        return
+
+    mp = data.get("marketplace")
+    scheme = data.get("scheme")
+    inputs = data.get("inputs", {})
+    results = data.get("results", {})
+    acc = data.get("accuracy", "")
+    notes = data.get("accuracy_notes", [])
+    options = data.get("options", [])
+    sku_label = data.get("sku_label")
+
+    def getv(k):
+        return inputs.get(k, {}).get("value")
+
+    in_sum = [
+        ("Маркетплейс", mp),
+        ("Схема", scheme),
+        ("Название / SKU", sku_label or "-"),
+        ("Цена", fmt_money(float(getv("price") or 0))),
+        ("Себестоимость", fmt_money(float(getv("cogs") or 0))),
+        ("Логистика", fmt_money(float(getv("logistics") or 0))),
+        ("Хранение", fmt_money(float(getv("storage") or 0))),
+        ("Возвраты, % заказов", fmt_pct(float(getv("returns_pct") or 0) * 100)),
+        ("Стоимость одного возврата", fmt_money(float(getv("return_cost") or 0))),
+        ("Реклама", f"{fmt_money(results.get('ads_rub'))} (ДРР {fmt_pct(results.get('drr_pct'))})"),
+        ("Прочие сборы", fmt_money(float(getv("other_fees") or 0))),
+        ("Прочие переменные расходы", fmt_money(float(getv("opex_var") or 0))),
+        ("Налог", fmt_money(results.get("tax"))),
+    ]
+
+    res_sum = [
+        ("Чистая прибыль", fmt_money(results.get("net_profit"))),
+        ("Маржа", fmt_pct(results.get("margin_pct"))),
+        ("Прибыль до налогов", fmt_money(results.get("profit_before_tax"))),
+        ("Безубыток (цена)", fmt_money(results.get("breakeven_price"))),
+        ("Макс. реклама", f"{fmt_money(results.get('max_ads_rub'))} (до {fmt_pct(results.get('max_drr_pct'))} ДРР)"),
+        ("Комиссия", fmt_money(results.get("commission_rub"))),
+        ("Ожид. затраты на возвраты", fmt_money(results.get("returns_cost_expected"))),
+    ]
+
+    pdf_bytes = build_pdf(
+        title="Отчёт по SKU (1 продажа)",
+        subtitle=f"{mp} / {scheme}",
+        inputs_summary=in_sum,
+        results_summary=res_sum,
+        accuracy=acc,
+        accuracy_notes=notes,
+        options=options,
+    )
+
+    doc = BufferedInputFile(pdf_bytes, filename="sku_report.pdf")
+    await bot.send_document(cb.from_user.id, doc)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("calc:history:"))
+async def history(cb: CallbackQuery, repo: Repo):
+    offset = int(cb.data.split(":")[-1])
+    rows = await repo.list_calculations(cb.from_user.id, limit=10, offset=offset)
+
+    if not rows and offset != 0:
+        await cb.answer("Больше нет", show_alert=False)
+        return
+    if not rows:
+        await cb.message.edit_text("История пуста.", reply_markup=main_menu_kb())
+        return
+
+    lines = ["Ваши сохранённые расчёты:"]
+    for r in rows:
+        res = r.get("results") if isinstance(r.get("results"), dict) else {}
+        np = res.get("net_profit")
+        lines.append(
+            f"• #{r['id']} {r['marketplace']}/{r['scheme']} — прибыль {fmt_money(np)} — {r['accuracy_level']}"
+        )
+
+    kb = InlineKeyboardBuilder()
+    for r in rows:
+        kb.button(
+            text=f"Открыть #{r['id']} ({r['marketplace']}/{r['scheme']})",
+            callback_data=f"calc:open:{r['id']}",
+        )
+    kb.adjust(1)
+
+    prev_off = max(0, offset - 10)
+    next_off = offset + 10
+    kb.row(
+        InlineKeyboardButton(text="◀️", callback_data=f"calc:history:{prev_off}"),
+        InlineKeyboardButton(text="▶️", callback_data=f"calc:history:{next_off}"),
+    )
+    kb.row(InlineKeyboardButton(text="🏠 Меню", callback_data="menu"))
+
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("calc:open:"))
+async def open_saved(cb: CallbackQuery, repo: Repo, state: FSMContext):
+    calc_id = int(cb.data.split(":")[-1])
+    row = await repo.get_calculation(cb.from_user.id, calc_id)
+    if not row:
+        await cb.answer("Расчёт не найден", show_alert=True)
+        return
+
+    # --- аккуратно достаём inputs / results из JSON или dict ---
+    raw_inputs = row.get("inputs") or {}
+    if isinstance(raw_inputs, str):
+        try:
+            inputs = json.loads(raw_inputs)
+        except Exception:
+            inputs = {}
+    else:
+        inputs = raw_inputs or {}
+
+    raw_results = row.get("results") or {}
+    if isinstance(raw_results, str):
+        try:
+            results = json.loads(raw_results)
+        except Exception:
+            results = {}
+    else:
+        results = raw_results or {}
+
+    mp = row.get("marketplace")
+    scheme = row.get("scheme")
+    sku_label = row.get("sku_label")
+
+    # Пытаемся пересчитать по текущей формуле,
+    # если не получится — используем сохранённые results как есть
+    ci = None
+    try:
+        ci = _build_calcinputs(inputs)
+        results = compute(ci)
+    except Exception:
+        pass
+
+    acc, notes = _notes(inputs)
+    options = _build_options(ci, results) if ci is not None else []
+
+    await state.update_data(
+        inputs=inputs,
+        results=results,
+        marketplace=mp,
+        scheme=scheme,
+        sku_label=sku_label,
+        accuracy=acc,
+        accuracy_notes=notes,
+        options=options,
+        used_credit_type=row.get("used_credit_type", "HISTORY"),
+        current_calc_id=calc_id,
+    )
+
+    text = _build_result_text(mp, scheme, inputs, results, acc, notes, options, sku_label=sku_label)
+    await cb.message.edit_text(text, reply_markup=result_saved_kb(calc_id))
+
+
+@router.callback_query(F.data.startswith("calc:delete:"))
+async def delete_saved(cb: CallbackQuery, repo: Repo, state: FSMContext):
+    calc_id = int(cb.data.split(":")[-1])
+    ok = await repo.delete_calculation(cb.from_user.id, calc_id)
+    if not ok:
+        await cb.answer("Не получилось удалить расчёт", show_alert=True)
+        return
+    await cb.answer("Удалено", show_alert=False)
+
+    rows = await repo.list_calculations(cb.from_user.id, limit=10, offset=0)
+    if not rows:
+        await cb.message.edit_text("История пуста.", reply_markup=main_menu_kb())
+        return
+    lines = ["Ваши сохранённые расчёты:"]
+    for r in rows:
+        res = r.get("results") if isinstance(r.get("results"), dict) else {}
+        np = res.get("net_profit")
+        lines.append(
+            f"• #{r['id']} {r['marketplace']}/{r['scheme']} — прибыль {fmt_money(np)} — {r['accuracy_level']}"
+        )
+
+    kb = InlineKeyboardBuilder()
+    for r in rows:
+        kb.button(
+            text=f"Открыть #{r['id']} ({r['marketplace']}/{r['scheme']})",
+            callback_data=f"calc:open:{r['id']}",
+        )
+    kb.adjust(1)
+    kb.row(
+        InlineKeyboardButton(text="◀️", callback_data="calc:history:0"),
+        InlineKeyboardButton(text="▶️", callback_data="calc:history:10"),
+    )
+    kb.row(InlineKeyboardButton(text="🏠 Меню", callback_data="menu"))
+
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())

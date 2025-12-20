@@ -1,0 +1,247 @@
+from __future__ import annotations
+import json
+from typing import Any, Optional
+from app.db import Database
+
+class Repo:
+    def __init__(self, db: Database):
+        self.db = db
+
+    async def upsert_user_on_start(self, tg_user_id: int) -> dict:
+        row = await self.db.fetchrow("SELECT * FROM users WHERE tg_user_id=$1", tg_user_id)
+        if row:
+            await self.db.execute("UPDATE users SET last_seen=now(), started_count=started_count+1 WHERE tg_user_id=$1", tg_user_id)
+        else:
+            await self.db.execute("INSERT INTO users (tg_user_id, started_count) VALUES ($1, 1)", tg_user_id)
+        row2 = await self.db.fetchrow("SELECT * FROM users WHERE tg_user_id=$1", tg_user_id)
+        return dict(row2)
+
+    async def touch_user(self, tg_user_id: int) -> None:
+        await self.db.execute("UPDATE users SET last_seen=now() WHERE tg_user_id=$1", tg_user_id)
+
+    async def get_user(self, tg_user_id: int) -> Optional[dict]:
+        row = await self.db.fetchrow("SELECT * FROM users WHERE tg_user_id=$1", tg_user_id)
+        return dict(row) if row else None
+
+    async def ensure_user(self, tg_user_id: int) -> dict:
+        row = await self.get_user(tg_user_id)
+        if row:
+            return row
+        await self.db.execute("INSERT INTO users (tg_user_id, started_count) VALUES ($1, 0)", tg_user_id)
+        return await self.get_user(tg_user_id)
+
+    async def consume_credit(self, tg_user_id: int) -> str:
+        # returns 'FREE' or 'PAID'; raises if none
+        row = await self.db.fetchrow("SELECT free_credits, paid_credits FROM users WHERE tg_user_id=$1", tg_user_id)
+        if not row:
+            raise RuntimeError("User not found")
+        if row["free_credits"] > 0:
+            await self.db.execute("UPDATE users SET free_credits=free_credits-1 WHERE tg_user_id=$1", tg_user_id)
+            return "FREE"
+        if row["paid_credits"] > 0:
+            await self.db.execute("UPDATE users SET paid_credits=paid_credits-1 WHERE tg_user_id=$1", tg_user_id)
+            return "PAID"
+        raise RuntimeError("NO_CREDITS")
+
+    async def add_paid_credits(self, tg_user_id: int, credits: int) -> None:
+        await self.db.execute("UPDATE users SET paid_credits=paid_credits+$2 WHERE tg_user_id=$1", tg_user_id, credits)
+
+    async def save_calculation(self, *, tg_user_id: int, marketplace: str, scheme: str, sku_label: str | None,
+                               inputs: dict, results: dict, accuracy_level: str, used_credit_type: str) -> int:
+        user = await self.db.fetchrow("SELECT id FROM users WHERE tg_user_id=$1", tg_user_id)
+        if not user:
+            raise RuntimeError("User not found")
+        row = await self.db.fetchrow(
+            """INSERT INTO calculations (user_id, marketplace, scheme, sku_label, inputs, results, accuracy_level, used_credit_type)
+                 VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8) RETURNING id""",
+            user["id"], marketplace, scheme, sku_label, json.dumps(inputs), json.dumps(results), accuracy_level, used_credit_type
+        )
+        return int(row["id"])
+
+    async def list_calculations(self, tg_user_id: int, limit: int = 20, offset: int = 0, marketplace: str | None = None) -> list[dict]:
+        user = await self.db.fetchrow("SELECT id FROM users WHERE tg_user_id=$1", tg_user_id)
+        if not user:
+            return []
+        if marketplace:
+            rows = await self.db.fetch(
+                """SELECT id, created_at, marketplace, scheme, sku_label, results, accuracy_level
+                   FROM calculations WHERE user_id=$1 AND marketplace=$2
+                   ORDER BY created_at DESC LIMIT $3 OFFSET $4""",
+                user["id"], marketplace, limit, offset
+            )
+        else:
+            rows = await self.db.fetch(
+                """SELECT id, created_at, marketplace, scheme, sku_label, results, accuracy_level
+                   FROM calculations WHERE user_id=$1
+                   ORDER BY created_at DESC LIMIT $2 OFFSET $3""",
+                user["id"], limit, offset
+            )
+        out=[]
+        for r in rows:
+            out.append({**dict(r), "results": dict(r["results"]) if isinstance(r["results"], dict) else r["results"]})
+        return out
+
+    async def get_calculation(self, tg_user_id: int, calc_id: int) -> dict | None:
+    	# Находим внутренний id пользователя
+    	user_row = await self.db.fetchrow(
+      	    "SELECT id FROM users WHERE tg_user_id=$1",
+            tg_user_id,
+    	)
+    	if not user_row:
+      	    return None
+
+    	# Берём расчёт по id + user_id
+    	row = await self.db.fetchrow(
+            "SELECT * FROM calculations WHERE id=$1 AND user_id=$2",
+            calc_id,
+            user_row["id"],
+    	)
+    	if not row:
+            return None
+
+    	data = dict(row)
+    	# Приводим jsonb к обычным dict, чтобы хендлеру было удобно
+    	for key in ("inputs", "results"):
+            v = data.get(key)
+            try:
+                if v is not None and not isinstance(v, dict):
+                    data[key] = dict(v)
+       	    except Exception:
+            	data[key] = v
+    	return data
+
+    async def admin_stats(self) -> dict:
+        users_total = await self.db.fetchrow("SELECT COUNT(*) AS c FROM users")
+        started_total = await self.db.fetchrow("SELECT SUM(started_count) AS s FROM users")
+        users_started = await self.db.fetchrow("SELECT COUNT(*) AS c FROM users WHERE started_count>0")
+        calcs_total = await self.db.fetchrow("SELECT COUNT(*) AS c FROM calculations")
+        free_used = await self.db.fetchrow("SELECT COUNT(*) AS c FROM calculations WHERE used_credit_type='FREE'")
+        paid_used = await self.db.fetchrow("SELECT COUNT(*) AS c FROM calculations WHERE used_credit_type='PAID'")
+        pay_sum = await self.db.fetchrow("SELECT COALESCE(SUM(amount_rub),0) AS s FROM payments WHERE status='SUCCEEDED'")
+        pay_cnt = await self.db.fetchrow("SELECT COUNT(*) AS c FROM payments WHERE status='SUCCEEDED'")
+
+        return {
+            "users_total": int(users_total["c"]),
+            "users_started": int(users_started["c"]),
+            "starts_total": int(started_total["s"] or 0),
+            "calculations_total": int(calcs_total["c"]),
+            "free_calculations": int(free_used["c"]),
+            "paid_calculations": int(paid_used["c"]),
+            "payments_count": int(pay_cnt["c"]),
+            "payments_sum_rub": int(pay_sum["s"]),
+        }
+
+    async def admin_export_rows(self) -> tuple[list[dict], list[dict]]:
+        # Users with calc usage breakdown
+        rows = await self.db.fetch(
+            """SELECT u.tg_user_id, u.created_at, u.last_seen, u.started_count, u.free_credits, u.paid_credits,
+                      COALESCE(SUM(CASE WHEN c.used_credit_type='FREE' THEN 1 ELSE 0 END),0) AS free_used,
+                      COALESCE(SUM(CASE WHEN c.used_credit_type='PAID' THEN 1 ELSE 0 END),0) AS paid_used,
+                      COALESCE(COUNT(c.id),0) AS total_calcs
+                 FROM users u
+                 LEFT JOIN calculations c ON c.user_id=u.id
+                 GROUP BY u.id
+                 ORDER BY u.created_at DESC"""
+        )
+        users_rows = [dict(r) for r in rows]
+
+        pays = await self.db.fetch(
+            """SELECT u.tg_user_id, p.created_at, p.provider_payment_id, p.status, p.pack_sku_credits, p.amount_rub
+                 FROM payments p
+                 JOIN users u ON u.id=p.user_id
+                 ORDER BY p.created_at DESC"""
+        )
+        payments_rows = [dict(r) for r in pays]
+        return users_rows, payments_rows
+
+    async def create_payment_record(self, tg_user_id: int, provider: str, provider_payment_id: str, status: str,
+                                    pack_credits: int, amount_rub: int, raw: dict) -> None:
+        user = await self.db.fetchrow("SELECT id FROM users WHERE tg_user_id=$1", tg_user_id)
+        if not user:
+            raise RuntimeError("User not found")
+        await self.db.execute(
+            """INSERT INTO payments (user_id, provider, provider_payment_id, status, pack_sku_credits, amount_rub, raw)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
+                 ON CONFLICT (provider_payment_id) DO NOTHING""",
+            user["id"], provider, provider_payment_id, status, pack_credits, amount_rub, json.dumps(raw)
+        )
+
+    async def update_payment_status(self, provider_payment_id: str, status: str, raw: dict) -> None:
+        await self.db.execute(
+            "UPDATE payments SET status=$2, raw=$3::jsonb WHERE provider_payment_id=$1",
+            provider_payment_id, status, json.dumps(raw)
+        )
+
+    async def get_payment(self, provider_payment_id: str) -> Optional[dict]:
+        row = await self.db.fetchrow("SELECT * FROM payments WHERE provider_payment_id=$1", provider_payment_id)
+        return dict(row) if row else None
+
+    async def list_user_ids(self, segment: str) -> list[int]:
+        # segment: all | free_remaining | free_finished | buyers
+        if segment == "all":
+            rows = await self.db.fetch("SELECT tg_user_id FROM users")
+        elif segment == "free_remaining":
+            rows = await self.db.fetch("SELECT tg_user_id FROM users WHERE free_credits>0")
+        elif segment == "free_finished":
+            rows = await self.db.fetch("SELECT tg_user_id FROM users WHERE free_credits=0")
+        elif segment == "buyers":
+            rows = await self.db.fetch(
+                """SELECT DISTINCT u.tg_user_id
+                   FROM users u
+                   JOIN payments p ON p.user_id=u.id
+                  WHERE p.status='SUCCEEDED'"""
+            )
+        else:
+            rows = []
+        return [int(r["tg_user_id"]) for r in rows]
+
+    async def delete_calculation(self, tg_user_id: int, calc_id: int) -> bool:
+        """
+        Удалить сохранённый расчёт пользователя.
+        Возвращает True, если что-то удалилось.
+        """
+        row = await self.db.fetchrow(
+            "DELETE FROM calculations WHERE id=$1 AND tg_user_id=$2 RETURNING id",
+            calc_id,
+            tg_user_id,
+        )
+        return row is not None
+
+    async def get_calculation(self, tg_user_id: int, calc_id: int):
+        """
+        Вернуть один сохранённый расчёт пользователя.
+        """
+        row = await self.db.fetchrow(
+            "SELECT * FROM calculations WHERE id = $1 AND tg_user_id = $2",
+            calc_id,
+            tg_user_id,
+        )
+        return dict(row) if row else None
+
+    async def delete_calculation(self, tg_user_id: int, calc_id: int) -> bool:
+        """
+        Удалить сохранённый расчёт. True, если запись была.
+        """
+        row = await self.db.fetchrow(
+            "DELETE FROM calculations "
+            "WHERE id = $1 AND tg_user_id = $2 "
+            "RETURNING id",
+            calc_id,
+            tg_user_id,
+        )
+        return row is not None
+
+    async def grant_free_credits(self, tg_user_id: int, amount: int) -> None:
+        """
+        Начислить пользователю дополнительные бесплатные SKU.
+        Не влияет на статистику оплат.
+        """
+        await self.db.execute(
+            """
+            UPDATE users
+            SET free_credits = COALESCE(free_credits, 0) + $1
+            WHERE tg_user_id = $2
+            """,
+            amount,
+            tg_user_id,
+        )
