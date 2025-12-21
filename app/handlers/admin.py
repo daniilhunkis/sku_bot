@@ -66,12 +66,21 @@ async def admin_export(cb: CallbackQuery, repo: Repo, config: Config, bot: Bot):
     if not _is_admin(cb.from_user.id, config):
         return
 
-    users_rows, payments_rows = await repo.admin_export_rows()
-    xlsx_bytes = build_admin_export(users_rows, payments_rows)
-
-    doc = BufferedInputFile(xlsx_bytes, filename="admin_export.xlsx")
-    await bot.send_document(cb.from_user.id, doc)
-    await cb.answer("Экспорт отправлен", show_alert=False)
+    try:
+        users_rows, payments_rows = await repo.admin_export_rows()
+        xlsx_bytes = build_admin_export(users_rows, payments_rows)
+        
+        if not xlsx_bytes or len(xlsx_bytes) < 100:
+            await cb.answer("Ошибка: файл не сгенерирован или слишком мал", show_alert=True)
+            return
+            
+        doc = BufferedInputFile(xlsx_bytes, filename="admin_export.xlsx")
+        await bot.send_document(cb.from_user.id, doc)
+        await cb.answer("✅ Экспорт отправлен", show_alert=False)
+        
+    except Exception as e:
+        await cb.answer(f"Ошибка экспорта: {str(e)[:50]}", show_alert=True)
+        print(f"Export error: {e}")  # Для логов
 
 
 # --- начисление SKU ---

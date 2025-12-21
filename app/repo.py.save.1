@@ -23,14 +23,73 @@ class Repo:
         row = await self.db.fetchrow("SELECT * FROM users WHERE tg_user_id=$1", tg_user_id)
         return dict(row) if row else None
 
-    async def ensure_user(self, tg_user_id: int) -> dict:
-        row = await self.get_user(tg_user_id)
-        if row:
-            return row
-        await self.db.execute("INSERT INTO users (tg_user_id, started_count) VALUES ($1, 0)", tg_user_id)
-        return await self.get_user(tg_user_id)
+    async def get_users_by_segment(self, segment: str) -> list[dict]:
+    	"""
+    	Получить пользователей по сегментам:
+    	- 'all': все пользователи
+   	- 'started': нажали старт
+    	- 'free_used': использовали бесплатные расчёты
+    	- 'free_finished': бесплатные расчёты закончились
+    	- 'buyers': купили расчёты
+    	- 'inactive': стартанули, но расчётов нет
+    	"""
+    
+    	if segment == "all":
+            rows = await self.db.fetch("SELECT * FROM users ORDER BY created_at DESC")
+    
+    	elif segment == "started":
+              rows = await self.db.fetch("SELECT * FROM users WHERE started_count > 0 ORDER BY created_at DESC")
+    
+    	elif segment == "free_used":
+              rows = await self.db.fetch("""
+            	  SELECT DISTINCT u.* 
+             	  FROM users u
+            	  JOIN calculations c ON c.user_id = u.id
+            	WHERE c.used_credit_type = 'FREE'
+            	ORDER BY u.created_at DESC
+             """)
+    
+    elif segment == "free_finished":
+        rows = await self.db.fetch("""
+            SELECT u.* 
+            FROM users u
+            WHERE u.free_credits = 0 
+            AND u.paid_credits = 0
+            AND EXISTS (
+                SELECT 1 FROM calculations c 
+                WHERE c.user_id = u.id 
+                AND c.used_credit_type = 'FREE'
+            )
+            ORDER BY u.created_at DESC
+        """)
+    
+    elif segment == "buyers":
+        rows = await self.db.fetch("""
+            SELECT DISTINCT u.* 
+            FROM users u
+            JOIN payments p ON p.user_id = u.id
+            WHERE p.status = 'SUCCEEDED'
+            ORDER BY u.created_at DESC
+        """)
+    
+    elif segment == "inactive":
+        rows = await self.db.fetch("""
+            SELECT u.* 
+            FROM users u
+            WHERE u.started_count > 0 
+            AND NOT EXISTS (
+                SELECT 1 FROM calculations c WHERE c.user_id = u.id
+            )
+            ORDER BY u.created_at DESC
+        """)
+    
+    else:
+        rows = []
+    
+    return [dict(r) for r in rows]
 
     async def consume_credit(self, tg_user_id: int) -> str:
+        # returns 'FREE' or 'PAID'; raises if none
         row = await self.db.fetchrow("SELECT free_credits, paid_credits FROM users WHERE tg_user_id=$1", tg_user_id)
         if not row:
             raise RuntimeError("User not found")
@@ -58,6 +117,7 @@ class Repo:
         return int(row["id"])
 
     async def list_calculations(self, tg_user_id: int, limit: int = 20, offset: int = 0, marketplace: str | None = None) -> list[dict]:
+        # ИСПРАВЛЕНО: ищем по внутреннему user.id, а не tg_user_id
         user = await self.db.fetchrow("SELECT id FROM users WHERE tg_user_id=$1", tg_user_id)
         if not user:
             return []
@@ -67,14 +127,14 @@ class Repo:
                 """SELECT id, created_at, marketplace, scheme, sku_label, results, accuracy_level
                    FROM calculations WHERE user_id=$1 AND marketplace=$2
                    ORDER BY created_at DESC LIMIT $3 OFFSET $4""",
-                user["id"], marketplace, limit, offset
+                user["id"], marketplace, limit, offset  # <-- user["id"] вместо tg_user_id
             )
         else:
             rows = await self.db.fetch(
                 """SELECT id, created_at, marketplace, scheme, sku_label, results, accuracy_level
                    FROM calculations WHERE user_id=$1
                    ORDER BY created_at DESC LIMIT $2 OFFSET $3""",
-                user["id"], limit, offset
+                user["id"], limit, offset  # <-- user["id"] вместо tg_user_id
             )
         
         out = []
@@ -83,7 +143,7 @@ class Repo:
         return out
 
     async def get_calculation(self, tg_user_id: int, calc_id: int) -> dict | None:
-        """ИСПРАВЛЕННАЯ ВЕРСИЯ: использует user_id, а не tg_user_id"""
+        # ИСПРАВЛЕНО: ищем по внутреннему user.id
         user = await self.db.fetchrow("SELECT id FROM users WHERE tg_user_id=$1", tg_user_id)
         if not user:
             return None
@@ -91,12 +151,13 @@ class Repo:
         row = await self.db.fetchrow(
             "SELECT * FROM calculations WHERE id=$1 AND user_id=$2",
             calc_id,
-            user["id"],
+            user["id"],  # <-- user["id"] вместо tg_user_id
         )
         if not row:
             return None
 
         data = dict(row)
+        # Приводим jsonb к обычным dict, чтобы хендлеру было удобно
         for key in ("inputs", "results"):
             v = data.get(key)
             try:
@@ -128,6 +189,7 @@ class Repo:
         }
 
     async def admin_export_rows(self) -> tuple[list[dict], list[dict]]:
+        # Users with calc usage breakdown
         rows = await self.db.fetch(
             """SELECT u.tg_user_id, u.created_at, u.last_seen, u.started_count, u.free_credits, u.paid_credits,
                       COALESCE(SUM(CASE WHEN c.used_credit_type='FREE' THEN 1 ELSE 0 END),0) AS free_used,
@@ -172,6 +234,7 @@ class Repo:
         return dict(row) if row else None
 
     async def list_user_ids(self, segment: str) -> list[int]:
+        # segment: all | free_remaining | free_finished | buyers
         if segment == "all":
             rows = await self.db.fetch("SELECT tg_user_id FROM users")
         elif segment == "free_remaining":
@@ -189,7 +252,13 @@ class Repo:
             rows = []
         return [int(r["tg_user_id"]) for r in rows]
 
+    # ИСПРАВЛЕНО: была только одна функция delete_calculation, но с ошибкой WHERE
     async def delete_calculation(self, tg_user_id: int, calc_id: int) -> bool:
+        """
+        Удалить сохранённый расчёт пользователя.
+        Возвращает True, если что-то удалилось.
+        """
+        # Находим внутренний ID пользователя
         user = await self.db.fetchrow("SELECT id FROM users WHERE tg_user_id=$1", tg_user_id)
         if not user:
             return False
@@ -197,11 +266,15 @@ class Repo:
         row = await self.db.fetchrow(
             "DELETE FROM calculations WHERE id=$1 AND user_id=$2 RETURNING id",
             calc_id,
-            user["id"],
+            user["id"],  # <-- user["id"] вместо tg_user_id
         )
         return row is not None
 
     async def grant_free_credits(self, tg_user_id: int, amount: int) -> None:
+        """
+        Начислить пользователю дополнительные бесплатные SKU.
+        Не влияет на статистику оплат.
+        """
         await self.db.execute(
             """
             UPDATE users

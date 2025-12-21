@@ -3,15 +3,11 @@ from aiogram.fsm.state import StatesGroup, State
 
 
 class CalcFlow(StatesGroup):
-    choosing_mp = State()
-    choosing_scheme = State()
-    entering_label = State()       # <— НОВОЕ
-    entering_value = State()
-    choosing_commission_mode = State()
-    choosing_ads_mode = State()
-    choosing_tax_mode = State()
-    entering_custom_tax = State()
-    confirm = State()
+    choosing_mp = State()           # 1. Выбор маркетплейса
+    choosing_scheme = State()       # 2. Выбор схемы
+    entering_label = State()        # 3. Ввод названия
+    entering_value = State()        # 4. Ввод значений
+    confirm = State()               # 5. Результат
 
 class BroadcastFlow(StatesGroup):
     choosing_segment = State()
